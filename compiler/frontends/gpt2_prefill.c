@@ -6,15 +6,22 @@
 #include <stdio.h>
 
 OrionGraph* orion_frontend_gpt2_prefill_attn(int layer, int bucket, const OrionModelConfig* cfg) {
+    return orion_frontend_gpt2_prefill_attn_io(layer, bucket, cfg, ORION_IO_FP32);
+}
+
+OrionGraph* orion_frontend_gpt2_prefill_attn_io(int layer, int bucket, const OrionModelConfig* cfg, OrionIODtype dtype) {
+    OrionDtype io = dtype == ORION_IO_FP16 ? ORION_DTYPE_FP16 : ORION_DTYPE_FP32;
+    int (*cast_output)(OrionGraph*, int, const char*, int, int) =
+        dtype == ORION_IO_FP16 ? orion_pattern_cast_to_fp16 : orion_pattern_cast_to_fp32;
     int d  = cfg->d_model;
     int nh = cfg->n_head;
     int hd = cfg->head_dim;
     int s  = bucket;
     OrionGraph* g = orion_graph_create();
 
-    // Input: fp32 [1, d, 1, s]
+    // Input uses the selected program boundary format.
     int in_shape[4] = {1, d, 1, s};
-    int x = orion_gb_input(g, "x", ORION_DTYPE_FP32, in_shape);
+    int x = orion_gb_input(g, "x", io, in_shape);
 
     // Cast to fp16
     int x16 = orion_pattern_cast_to_fp16(g, x, "x16", d, s);
@@ -58,10 +65,10 @@ OrionGraph* orion_frontend_gpt2_prefill_attn(int layer, int bucket, const OrionM
     // Residual
     int resid = orion_pattern_residual(g, x16, proj, "resid");
 
-    // Cast outputs to fp32
-    int hidden = orion_pattern_cast_to_fp32(g, resid, "hidden", d, s);
-    int k_cache = orion_pattern_cast_to_fp32(g, k, "k_cache", d, s);
-    int v_cache = orion_pattern_cast_to_fp32(g, v, "v_cache", d, s);
+    // Select boundary dtype; fp16 identity casts are eliminated.
+    int hidden = cast_output(g, resid, "hidden", d, s);
+    int k_cache = cast_output(g, k, "k_cache", d, s);
+    int v_cache = cast_output(g, v, "v_cache", d, s);
 
     // Mark outputs
     orion_gb_output(g, hidden, "hidden");
@@ -72,6 +79,13 @@ OrionGraph* orion_frontend_gpt2_prefill_attn(int layer, int bucket, const OrionM
 }
 
 OrionGraph* orion_frontend_gpt2_prefill_ffn(int layer, int bucket, const OrionModelConfig* cfg) {
+    return orion_frontend_gpt2_prefill_ffn_io(layer, bucket, cfg, ORION_IO_FP32);
+}
+
+OrionGraph* orion_frontend_gpt2_prefill_ffn_io(int layer, int bucket, const OrionModelConfig* cfg, OrionIODtype dtype) {
+    OrionDtype io = dtype == ORION_IO_FP16 ? ORION_DTYPE_FP16 : ORION_DTYPE_FP32;
+    int (*cast_output)(OrionGraph*, int, const char*, int, int) =
+        dtype == ORION_IO_FP16 ? orion_pattern_cast_to_fp16 : orion_pattern_cast_to_fp32;
     int d = cfg->d_model;
     int h = cfg->hidden_dim;
     int s = bucket;
@@ -79,7 +93,7 @@ OrionGraph* orion_frontend_gpt2_prefill_ffn(int layer, int bucket, const OrionMo
 
     // Input
     int in_shape[4] = {1, d, 1, s};
-    int x = orion_gb_input(g, "x", ORION_DTYPE_FP32, in_shape);
+    int x = orion_gb_input(g, "x", io, in_shape);
     int x16 = orion_pattern_cast_to_fp16(g, x, "x16", d, s);
 
     // LayerNorm 2
@@ -102,8 +116,8 @@ OrionGraph* orion_frontend_gpt2_prefill_ffn(int layer, int bucket, const OrionMo
     // Residual
     int resid = orion_pattern_residual(g, x16, ffn, "resid");
 
-    // Cast to fp32
-    int hidden = orion_pattern_cast_to_fp32(g, resid, "hidden", d, s);
+    // Select boundary dtype; fp16 identity casts are eliminated.
+    int hidden = cast_output(g, resid, "hidden", d, s);
 
     orion_gb_output(g, hidden, "hidden");
     return g;

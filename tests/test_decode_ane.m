@@ -1,7 +1,7 @@
 // test_decode_ane.m — T100: Test ANE decode MIL generators
 //
 // Tests that compiler frontend generates valid MIL programs
-// that compile and eval on ANE with seq=ORION_GRAPH_DECODE_SEQ (16).
+// that compile and eval on ANE with the runtime-selected decode padding.
 //
 // Build:
 //   xcrun clang -O2 -fobjc-arc -DACCELERATE_NEW_LAPACK \
@@ -20,11 +20,13 @@
 #import <sys/time.h>
 #import "core/ane_runtime.h"
 #import "core/iosurface_tensor.h"
+#import "core/ane_io.h"
 #import "core/mil_builder.h"
 #include "compiler/kernel_adapter.h"
 #include "compiler/frontends/gpt2_decode.h"
 
 static int g_pass = 0, g_fail = 0;
+static const OrionANEIO *io_policy;
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -64,34 +66,23 @@ static NSData* make_blobfile(int num_elements, float fill_value) {
 
 #pragma mark - IOSurface helpers
 
-// Create fp32 surface for [1, channels, 1, seq] ANE layout
-static IOSurfaceRef make_f32_surface(int count) {
-    size_t bytes = count * sizeof(float);
-    return IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
+static IOSurfaceRef make_io_surface(int count) {
+    return orion_io_tensor_create(1, count, io_policy->dtype);
 }
 
-// Write fp32 data into IOSurface in ANE layout [1, C, 1, S].
-// data is in column-major: data[c * seq + s] for channel c at seq position s.
 static void write_f32_surface(IOSurfaceRef s, const float *data, int count) {
-    IOSurfaceLock(s, 0, NULL);
-    memcpy(IOSurfaceGetBaseAddress(s), data, count * sizeof(float));
-    IOSurfaceUnlock(s, 0, NULL);
+    orion_io_write_f32(s, data, count, io_policy->dtype);
 }
 
 static void read_f32_surface(IOSurfaceRef s, float *out, int count) {
-    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
-    memcpy(out, IOSurfaceGetBaseAddress(s), count * sizeof(float));
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    orion_io_read_f32(s, out, count, io_policy->dtype);
 }
 
 // Create a [1, channels, 1, seq] surface with val at seq position 0, zero elsewhere.
 // ANE layout: element at (c, s) is stored at offset c * seq + s.
 static IOSurfaceRef make_decode_input(int channels, int seq, float val) {
     int count = channels * seq;
-    IOSurfaceRef s = make_f32_surface(count);
+    IOSurfaceRef s = make_io_surface(count);
     float *data = (float *)calloc(count, sizeof(float));
     // Set position 0 for each channel
     for (int c = 0; c < channels; c++) {
@@ -168,12 +159,12 @@ static void test_decode_proj_mil_generation(void) {
         .n_layer = 12, .n_head = 12, .d_model = 768,
         .head_dim = 64, .hidden_dim = 3072, .vocab = 50257, .max_seq = 1024
     };
-    NSString *mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_proj,0, &cfg);
+    NSString *mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_proj_io, 0, &cfg, io_policy->dtype);
     ASSERT(mil != nil, "MIL text should not be nil");
     ASSERT(mil.length > 100, "MIL text should be substantial");
     ASSERT([mil containsString:@"func main<ios18>"], "Should have function header");
-    ASSERT([mil containsString:@"[1,768,1,16]"], "Should use seq=16 tensors");
-    ASSERT([mil containsString:@"-> (q32, k32, v32)"], "Should have 3 outputs");
+    ASSERT(([mil containsString:[NSString stringWithFormat:@"[1,768,1,%d]", orion_io_decode_seq(io_policy->dtype)]]), "Should use selected decode padding");
+    ASSERT([mil containsString:io_policy->dtype == ORION_IO_FP16 ? @"-> (q_out, k_out, v_out)" : @"-> (q32, k32, v32)"], "Should have 3 outputs");
     PASS("decode_proj MIL generation correct");
 }
 
@@ -183,12 +174,12 @@ static void test_decode_ffn_mil_generation(void) {
         .n_layer = 12, .n_head = 12, .d_model = 768,
         .head_dim = 64, .hidden_dim = 3072, .vocab = 50257, .max_seq = 1024
     };
-    NSString *mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_ffn,0, &cfg);
+    NSString *mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_ffn_io, 0, &cfg, io_policy->dtype);
     ASSERT(mil != nil, "MIL text should not be nil");
     ASSERT(mil.length > 100, "MIL text should be substantial");
     ASSERT([mil containsString:@"func main<ios18>"], "Should have function header");
-    ASSERT([mil containsString:@"[1,768,1,16]"], "Should use seq=16 tensors");
-    ASSERT([mil containsString:@"-> (hidden)"], "Should have single output");
+    ASSERT(([mil containsString:[NSString stringWithFormat:@"[1,768,1,%d]", orion_io_decode_seq(io_policy->dtype)]]), "Should use selected decode padding");
+    ASSERT([mil containsString:io_policy->dtype == ORION_IO_FP16 ? @"-> (resid)" : @"-> (hidden)"], "Should have single output");
     PASS("decode_ffn MIL generation correct");
 }
 
@@ -199,14 +190,14 @@ static void test_decode_proj_compile_eval(void) {
         .head_dim = 64, .hidden_dim = 3072, .vocab = 50257, .max_seq = 1024
     };
     int d = cfg.d_model;
-    int seq = ORION_GRAPH_DECODE_SEQ;
+    int seq = orion_io_decode_seq(io_policy->dtype);
     int count = d * seq;
 
-    NSString *mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_proj,0, &cfg);
+    NSString *mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_proj_io, 0, &cfg, io_policy->dtype);
     NSDictionary *wdict = make_proj_weights(0, d);
 
     double t0 = time_ms();
-    OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, "decode_proj_L0");
+    OrionProgram *prog = orion_ane_io_compile(mil, wdict, io_policy, "decode_proj_L0");
     double t1 = time_ms();
     ASSERT(prog != NULL, "decode_proj should compile");
     printf("  compile time: %.1f ms\n", t1 - t0);
@@ -215,12 +206,12 @@ static void test_decode_proj_compile_eval(void) {
     IOSurfaceRef ioX = make_decode_input(d, seq, 1.0f);
 
     // 3 outputs: Q, K, V — each [1, d, 1, seq]
-    IOSurfaceRef ioQ = make_f32_surface(count);
-    IOSurfaceRef ioK = make_f32_surface(count);
-    IOSurfaceRef ioV = make_f32_surface(count);
+    IOSurfaceRef ioQ = make_io_surface(count);
+    IOSurfaceRef ioK = make_io_surface(count);
+    IOSurfaceRef ioV = make_io_surface(count);
 
     IOSurfaceRef ins[] = {ioX};
-    IOSurfaceRef outs[] = {ioQ, ioK, ioV};
+    IOSurfaceRef outs[] = {ioK, ioQ, ioV};
 
     // Warmup
     bool ok = orion_eval(prog, ins, 1, outs, 3);
@@ -265,21 +256,21 @@ static void test_decode_ffn_compile_eval(void) {
     };
     int d = cfg.d_model;
     int h = cfg.hidden_dim;
-    int seq = ORION_GRAPH_DECODE_SEQ;
+    int seq = orion_io_decode_seq(io_policy->dtype);
     int count = d * seq;
 
-    NSString *mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_ffn,0, &cfg);
+    NSString *mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_ffn_io, 0, &cfg, io_policy->dtype);
     NSDictionary *wdict = make_ffn_weights(0, d, h);
 
     double t0 = time_ms();
-    OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, "decode_ffn_L0");
+    OrionProgram *prog = orion_ane_io_compile(mil, wdict, io_policy, "decode_ffn_L0");
     double t1 = time_ms();
     ASSERT(prog != NULL, "decode_ffn should compile");
     printf("  compile time: %.1f ms\n", t1 - t0);
 
     // Input: x [1, d, 1, seq] with val=0.5 at position 0
     IOSurfaceRef ioX = make_decode_input(d, seq, 0.5f);
-    IOSurfaceRef ioH = make_f32_surface(count);
+    IOSurfaceRef ioH = make_io_surface(count);
 
     IOSurfaceRef ins[] = {ioX};
     IOSurfaceRef outs[] = {ioH};
@@ -331,13 +322,13 @@ static void test_decode_proj_multiple_layers(void) {
     int layers[] = {0, 5, 11};
     for (int i = 0; i < 3; i++) {
         int l = layers[i];
-        NSString *mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_proj,l, &cfg);
+        NSString *mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_proj_io, l, &cfg, io_policy->dtype);
         NSString *expected_path = [NSString stringWithFormat:@"layer%d/wq.bin", l];
         bool has_path = [mil containsString:expected_path];
         ASSERT(has_path, "should reference correct blob path for layer");
 
         NSDictionary *wdict = make_proj_weights(l, d);
-        OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, "multi_layer_proj");
+        OrionProgram *prog = orion_ane_io_compile(mil, wdict, io_policy, "multi_layer_proj");
         ASSERT(prog != NULL, "layer should compile");
         orion_release_program(prog);
     }
@@ -356,13 +347,13 @@ static void test_decode_ffn_multiple_layers(void) {
     int layers[] = {0, 5, 11};
     for (int i = 0; i < 3; i++) {
         int l = layers[i];
-        NSString *mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_ffn,l, &cfg);
+        NSString *mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_ffn_io, l, &cfg, io_policy->dtype);
         NSString *expected_path = [NSString stringWithFormat:@"layer%d/wfc.bin", l];
         bool has_path = [mil containsString:expected_path];
         ASSERT(has_path, "should reference correct blob path for layer");
 
         NSDictionary *wdict = make_ffn_weights(l, d, h);
-        OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, "multi_layer_ffn");
+        OrionProgram *prog = orion_ane_io_compile(mil, wdict, io_policy, "multi_layer_ffn");
         ASSERT(prog != NULL, "layer should compile");
         orion_release_program(prog);
     }
@@ -377,28 +368,28 @@ static void test_decode_perf(void) {
     };
     int d = cfg.d_model;
     int h = cfg.hidden_dim;
-    int seq = ORION_GRAPH_DECODE_SEQ;
+    int seq = orion_io_decode_seq(io_policy->dtype);
     int count = d * seq;
 
-    NSString *proj_mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_proj,0, &cfg);
+    NSString *proj_mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_proj_io, 0, &cfg, io_policy->dtype);
     NSDictionary *proj_wdict = make_proj_weights(0, d);
-    OrionProgram *proj_prog = orion_compile_mil(proj_mil.UTF8String, proj_wdict, "perf_proj");
+    OrionProgram *proj_prog = orion_ane_io_compile(proj_mil, proj_wdict, io_policy, "perf_proj");
     ASSERT(proj_prog != NULL, "proj should compile");
 
-    NSString *ffn_mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_ffn,0, &cfg);
+    NSString *ffn_mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_ffn_io, 0, &cfg, io_policy->dtype);
     NSDictionary *ffn_wdict = make_ffn_weights(0, d, h);
-    OrionProgram *ffn_prog = orion_compile_mil(ffn_mil.UTF8String, ffn_wdict, "perf_ffn");
+    OrionProgram *ffn_prog = orion_ane_io_compile(ffn_mil, ffn_wdict, io_policy, "perf_ffn");
     ASSERT(ffn_prog != NULL, "ffn should compile");
 
     IOSurfaceRef ioX = make_decode_input(d, seq, 0.5f);
-    IOSurfaceRef ioQ = make_f32_surface(count);
-    IOSurfaceRef ioK = make_f32_surface(count);
-    IOSurfaceRef ioV = make_f32_surface(count);
-    IOSurfaceRef ioH = make_f32_surface(count);
+    IOSurfaceRef ioQ = make_io_surface(count);
+    IOSurfaceRef ioK = make_io_surface(count);
+    IOSurfaceRef ioV = make_io_surface(count);
+    IOSurfaceRef ioH = make_io_surface(count);
 
     // Warmup
     IOSurfaceRef proj_ins[] = {ioX};
-    IOSurfaceRef proj_outs[] = {ioQ, ioK, ioV};
+    IOSurfaceRef proj_outs[] = {ioK, ioQ, ioV};
     orion_eval(proj_prog, proj_ins, 1, proj_outs, 3);
 
     IOSurfaceRef ffn_ins[] = {ioX};
@@ -434,6 +425,8 @@ int main(void) {
             return 1;
         }
 
+        io_policy = orion_ane_io_policy();
+        if (!io_policy) return 1;
         test_decode_proj_mil_generation();
         test_decode_ffn_mil_generation();
         test_decode_proj_compile_eval();

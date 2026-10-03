@@ -21,6 +21,7 @@
 #import "model/configs/gpt2_124m.h"
 #import "kernels/inference/decode_cpu.h"
 #import "kernels/inference/decode_ane.h"
+#import "kernels/inference/prefill_ane.h"
 #import "kernels/inference/kv_cache.h"
 #import "core/ane_runtime.h"
 
@@ -77,7 +78,7 @@ static void test_ane_greedy(OrionGPT2Weights* w,
 static void test_ane_vs_cpu(OrionGPT2Weights* w,
                               const char* name,
                               const int* prompt_tokens, int prompt_len,
-                              int gen_len) {
+                              int gen_len, bool full_prefill) {
     float* logits = (float*)malloc(w->vocab * sizeof(float));
 
     // CPU reference
@@ -91,7 +92,19 @@ static void test_ane_vs_cpu(OrionGPT2Weights* w,
 
     // ANE
     OrionKVCache* kv_ane = orion_kv_cache_create(&kGPT2_124M);
-    orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv_ane, logits);
+    if (full_prefill) {
+        if (!orion_ane_prefill(w, prompt_tokens, prompt_len, &kGPT2_124M,
+                              "model/blobs/gpt2_124m", kv_ane, logits)) {
+            printf("FAIL %s: required ANE prefill failed\n", name);
+            tests_failed++;
+            orion_kv_cache_free(kv_cpu);
+            orion_kv_cache_free(kv_ane);
+            free(logits);
+            return;
+        }
+    } else {
+        orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv_ane, logits);
+    }
     int ane_tokens[64];
     int match_count = 0;
     bool ane_failed = false;
@@ -111,6 +124,10 @@ static void test_ane_vs_cpu(OrionGPT2Weights* w,
     } else if (match_count == gen_len) {
         printf("PASS: %s → %d/%d tokens match (exact)\n", name, match_count, gen_len);
         tests_passed++;
+    } else if (full_prefill) {
+        printf("FAIL %s: %d/%d tokens match; full ANE regression requires exact output\n",
+               name, match_count, gen_len);
+        tests_failed++;
     } else {
         // fp16 drift may cause divergence after several steps
         printf("INFO %s: %d/%d tokens match (CPU: ", name, match_count, gen_len);
@@ -170,14 +187,31 @@ int main(int argc, const char* argv[]) {
         // Test 3: ANE vs CPU for 10 tokens from "Once upon a time"
         {
             int prompt[] = {7454, 2402, 257, 640};
-            test_ane_vs_cpu(w, "once_upon→10tok (ANE vs CPU)", prompt, 4, 10);
+            test_ane_vs_cpu(w, "once_upon→10tok (ANE vs CPU)", prompt, 4, 10, false);
         }
 
         // Test 4: ANE vs CPU for 10 tokens from "Hello"
         {
             int prompt[] = {15496};
-            test_ane_vs_cpu(w, "Hello→10tok (ANE vs CPU)", prompt, 1, 10);
+            test_ane_vs_cpu(w, "Hello→10tok (ANE vs CPU)", prompt, 1, 10, false);
         }
+
+        // Both phases must execute on the ANE path; no fallback is allowed.
+        {
+            int prompt[] = {15496, 995};
+            test_ane_vs_cpu(w, "Hello world→16tok (ANE prefill + decode)", prompt, 2, 16, true);
+        }
+        {
+            int prompt[] = {7454, 2402, 257, 640};
+            test_ane_vs_cpu(w, "once_upon→10tok (ANE prefill + decode)", prompt, 4, 10, true);
+        }
+
+        // Exercise larger causal masks, packed blobs and KV extraction.
+        const int phrase[] = {7454, 2402, 257, 640, 11, 612, 373, 257, 995, 13};
+        int long_prompt[70];
+        for (int i = 0; i < 70; i++) long_prompt[i] = phrase[i % 10];
+        test_ane_vs_cpu(w, "40-token prompt→4tok (bucket 64)", long_prompt, 40, 4, true);
+        test_ane_vs_cpu(w, "70-token prompt→4tok (bucket 128)", long_prompt, 70, 4, true);
 
         printf("\n=== Results: %d passed, %d failed ===\n",
                tests_passed, tests_failed);

@@ -3,6 +3,7 @@
 
 #import "ane_runtime.h"
 #import "ane_program_cache.h"
+#import "ane_io.h"
 #import <IOSurface/IOSurface.h>
 
 /// Function pointer type for MIL text generation.
@@ -26,11 +27,13 @@ typedef struct {
     OrionWDictFn build_wdict;   // Weight dictionary builder
     int n_inputs;               // Expected number of input IOSurfaces
     int n_outputs;              // Expected number of output IOSurfaces
+    bool pack_weights;          // Stage multiple blobs as one verified payload
+    OrionIODtype io_dtype;      // Program boundary format (part of cache identity)
 } OrionKernel;
 
 /// Compile-or-cache + eval a kernel in one call.
 ///
-/// 1. Looks up program in cache using (kernel->name, layer_idx, wb)
+/// 1. Looks up program by kernel name, I/O dtype, packing, layer_idx and wb
 /// 2. On miss: generate MIL, build wdict, compile, store in cache
 /// 3. Eval the program with provided IOSurfaces
 ///

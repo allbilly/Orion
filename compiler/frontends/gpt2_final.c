@@ -5,13 +5,20 @@
 #include "../patterns.h"
 
 OrionGraph* orion_frontend_gpt2_final_ln(int bucket, const OrionModelConfig* cfg) {
+    return orion_frontend_gpt2_final_ln_io(bucket, cfg, ORION_IO_FP32);
+}
+
+OrionGraph* orion_frontend_gpt2_final_ln_io(int bucket, const OrionModelConfig* cfg, OrionIODtype dtype) {
+    OrionDtype io = dtype == ORION_IO_FP16 ? ORION_DTYPE_FP16 : ORION_DTYPE_FP32;
+    int (*cast_output)(OrionGraph*, int, const char*, int, int) =
+        dtype == ORION_IO_FP16 ? orion_pattern_cast_to_fp16 : orion_pattern_cast_to_fp32;
     int d = cfg->d_model;
     int s = bucket;
     OrionGraph* g = orion_graph_create();
 
-    // Input: fp32 [1, d, 1, s]
+    // Input uses the selected program boundary format.
     int in_shape[4] = {1, d, 1, s};
-    int x = orion_gb_input(g, "x", ORION_DTYPE_FP32, in_shape);
+    int x = orion_gb_input(g, "x", io, in_shape);
 
     // Cast to fp16
     int x16 = orion_pattern_cast_to_fp16(g, x, "x16", d, s);
@@ -24,8 +31,8 @@ OrionGraph* orion_frontend_gpt2_final_ln(int bucket, const OrionModelConfig* cfg
                                       "@model_path/ln_f_b.bin", 64);
     int lnf = orion_gb_layernorm(g, x16, ln_g, ln_b, 1e-5f, "lnf", d, s);
 
-    // Cast to fp32
-    int hidden = orion_pattern_cast_to_fp32(g, lnf, "hidden", d, s);
+    // Select boundary dtype; fp16 identity casts are eliminated.
+    int hidden = cast_output(g, lnf, "hidden", d, s);
 
     orion_gb_output(g, hidden, "hidden");
     return g;

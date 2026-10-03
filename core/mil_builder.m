@@ -1,5 +1,6 @@
 #import "mil_builder.h"
 #import <math.h>
+#include <errno.h>
 
 // T019: orion_mil_linear (conv-based)
 // T020: orion_mil_layernorm, orion_mil_rmsnorm
@@ -375,4 +376,64 @@ NSData* orion_make_causal_mask_blob(int seq_len) {
 
 NSString* orion_causal_mask_path(int seq_len) {
     return [NSString stringWithFormat:@"@model_path/masks/causal_%d.bin", seq_len];
+}
+
+bool orion_mil_pack_weights(NSString* mil, NSDictionary* weights,
+                            NSString** packed_mil, NSDictionary** packed_weights) {
+    if (!mil || !weights.count || !packed_mil || !packed_weights) return false;
+    NSMutableData *data = [NSMutableData data];
+    NSMutableDictionary *offsets = [NSMutableDictionary dictionary];
+    for (NSString *path in [[weights allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+        NSDictionary *entry = weights[path];
+        NSData *blob = entry[@"data"];
+        if (![blob isKindOfClass:NSData.class] ||
+            ![entry[@"offset"] isKindOfClass:NSNumber.class] ||
+            [entry[@"offset"] unsignedLongLongValue] != 0)
+            return false;
+        // BLOBFILE chunk headers are aligned to 64 bytes.
+        NSUInteger padding = (64 - data.length % 64) % 64;
+        [data increaseLengthBy:padding];
+        offsets[path] = @(data.length);
+        [data appendData:blob];
+    }
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:
+        @"\\bBLOBFILE\\s*\\(\\s*path\\s*=\\s*string\\s*\\(\\s*\"([^\"]+)\"\\s*\\)\\s*,\\s*offset\\s*=\\s*uint64\\s*\\(\\s*([0-9]+)\\s*\\)\\s*\\)"
+        options:0 error:nil];
+    NSArray *matches = [regex matchesInString:mil options:0 range:NSMakeRange(0, mil.length)];
+    NSRegularExpression *references = [NSRegularExpression regularExpressionWithPattern:
+        @"\\bBLOBFILE\\s*\\(" options:0 error:nil];
+    // Never discard original files while leaving a reference unhandled.
+    if (matches.count == 0 || matches.count !=
+        [references numberOfMatchesInString:mil options:0 range:NSMakeRange(0, mil.length)]) return false;
+    NSMutableString *text = [mil mutableCopy];
+    for (NSTextCheckingResult *match in matches.reverseObjectEnumerator) {
+        NSString *path = [mil substringWithRange:[match rangeAtIndex:1]];
+        NSNumber *base = offsets[path];
+        errno = 0;
+        unsigned long long original = strtoull([[mil substringWithRange:[match rangeAtIndex:2]] UTF8String], NULL, 10);
+        if (errno == ERANGE) return false;
+        NSData *blob = weights[path][@"data"];
+        if (!base || original < 64 || original % 64 ||
+            original > blob.length || blob.length - original < 64) return false;
+        // BLOBFILE's chunk header contains an absolute file offset to its payload.
+        // Relocate that pointer as well as the MIL's chunk-header offset.
+        uint32_t magic, payloadSize;
+        uint64_t payloadOffset;
+        memcpy(&magic, (const uint8_t *)blob.bytes + original, sizeof(magic));
+        memcpy(&payloadSize, (const uint8_t *)blob.bytes + original + 8, sizeof(payloadSize));
+        memcpy(&payloadOffset, (const uint8_t *)blob.bytes + original + 16, sizeof(payloadOffset));
+        if (magic != 0xdeadbeef || payloadOffset < original + 64 ||
+            payloadOffset > blob.length || !payloadSize ||
+            payloadSize > blob.length - payloadOffset) return false;
+        uint64_t relocated = base.unsignedLongLongValue + payloadOffset;
+        memcpy((uint8_t *)data.mutableBytes + base.unsignedLongLongValue + original + 16,
+               &relocated, sizeof(relocated));
+        NSString *replacement = [NSString stringWithFormat:
+            @"BLOBFILE(path=string(\"@model_path/weights/packed.bin\"), offset=uint64(%llu))",
+            base.unsignedLongLongValue + original];
+        [text replaceCharactersInRange:match.range withString:replacement];
+    }
+    *packed_mil = text;
+    *packed_weights = @{@"@model_path/weights/packed.bin": @{@"offset": @0, @"data": data}};
+    return true;
 }

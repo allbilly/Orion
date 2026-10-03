@@ -19,34 +19,22 @@
 
 #pragma mark - IOSurface Helpers
 
-static IOSurfaceRef make_f32_surface(int count) {
-    size_t bytes = count * sizeof(float);
-    return IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
-}
-
 /// Write x[d] into ANE surface [1, d, 1, seq] at position 0.
-static void write_decode_input(IOSurfaceRef s, const float *x, int d, int seq) {
+static void write_decode_input(IOSurfaceRef s, const float *x, int d, int seq, OrionIODtype dtype) {
     int count = d * seq;
     float *data = (float *)calloc(count, sizeof(float));
     for (int c = 0; c < d; c++) {
         data[c * seq + 0] = x[c];
     }
-    IOSurfaceLock(s, 0, NULL);
-    memcpy(IOSurfaceGetBaseAddress(s), data, count * sizeof(float));
-    IOSurfaceUnlock(s, 0, NULL);
+    orion_io_write_f32(s, data, count, dtype);
     free(data);
 }
 
 /// Read position 0 from ANE surface [1, d, 1, seq] into x[d].
-static void read_decode_output(IOSurfaceRef s, float *x, int d, int seq) {
+static void read_decode_output(IOSurfaceRef s, float *x, int d, int seq, OrionIODtype dtype) {
     int count = d * seq;
     float *data = (float *)malloc(count * sizeof(float));
-    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
-    memcpy(data, IOSurfaceGetBaseAddress(s), count * sizeof(float));
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    orion_io_read_f32(s, data, count, dtype);
     for (int c = 0; c < d; c++) {
         x[c] = data[c * seq + 0];
     }
@@ -95,12 +83,14 @@ static NSDictionary* build_decode_ffn_wdict(int layer_idx, NSString *dir) {
 // Compiler MIL gen adapters — decode kernels ignore bucket
 static NSString* compiler_decode_proj_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
     (void)bucket;
-    return orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_proj, layer_idx, cfg);
+    return orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_proj_io,
+        layer_idx, cfg, orion_ane_io_policy()->dtype);
 }
 
 static NSString* compiler_decode_ffn_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
     (void)bucket;
-    return orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_ffn, layer_idx, cfg);
+    return orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_ffn_io,
+        layer_idx, cfg, orion_ane_io_policy()->dtype);
 }
 
 // Weight dict adapters
@@ -142,8 +132,13 @@ bool orion_ane_decode_step(const OrionGPT2Weights* w,
     int head_dim = kv->head_dim;
     int vocab = w->vocab;
     int pos = kv->current_len;
-    int seq = ORION_GRAPH_DECODE_SEQ;
-    int count = d * seq;
+    const OrionANEIO *policy = orion_ane_io_policy();
+    if (!policy) return false;
+    OrionIODtype dtype = policy->dtype;
+    int seq = orion_io_decode_seq(dtype);
+    OrionKernel proj = kDecodeProj, ffn = kDecodeFFN;
+    proj.io_dtype = ffn.io_dtype = dtype;
+    proj.pack_weights = ffn.pack_weights = policy->pack_weights;
 
     OrionModelConfig cfg = kGPT2_124M;
     OrionWeightsBinding wb = { .weights_id = "base", .bucket = seq };
@@ -159,23 +154,23 @@ bool orion_ane_decode_step(const OrionGPT2Weights* w,
     size_t layer_stride = (size_t)n_head * kv->max_seq * head_dim;
 
     // Reusable input surface
-    IOSurfaceRef ioInput = make_f32_surface(count);
+    IOSurfaceRef ioInput = orion_io_tensor_create(d, seq, dtype);
 
     for (int layer = 0; layer < n_layer; layer++) {
         const OrionGPT2LayerWeights *l = &w->layers[layer];
 
         // === ANE decode_proj: x → LN1 → Q, K, V ===
-        write_decode_input(ioInput, x, d, seq);
+        write_decode_input(ioInput, x, d, seq, dtype);
 
-        IOSurfaceRef ioQ = make_f32_surface(count);
-        IOSurfaceRef ioK = make_f32_surface(count);
-        IOSurfaceRef ioV = make_f32_surface(count);
+        IOSurfaceRef ioQ = orion_io_tensor_create(d, seq, dtype);
+        IOSurfaceRef ioK = orion_io_tensor_create(d, seq, dtype);
+        IOSurfaceRef ioV = orion_io_tensor_create(d, seq, dtype);
 
         // ANE orders multi-output surfaces alphabetically by MIL variable name.
-        // MIL returns (q32, k32, v32) → sorted: k32, q32, v32.
+        // Both boundary formats sort K before Q before V.
         IOSurfaceRef proj_ins[]  = {ioInput};
         IOSurfaceRef proj_outs[] = {ioK, ioQ, ioV};
-        bool ok = orion_kernel_eval(&kDecodeProj, layer, seq, &cfg,
+        bool ok = orion_kernel_eval(&proj, layer, seq, &cfg,
                                     blob_dir, &wb, proj_ins, 1, proj_outs, 3);
         if (!ok) {
             fprintf(stderr, "ANE decode: proj L%d failed\n", layer);
@@ -188,9 +183,9 @@ bool orion_ane_decode_step(const OrionGPT2Weights* w,
         float *q     = (float *)malloc(d * sizeof(float));
         float *k_new = (float *)malloc(d * sizeof(float));
         float *v_new = (float *)malloc(d * sizeof(float));
-        read_decode_output(ioQ, q, d, seq);
-        read_decode_output(ioK, k_new, d, seq);
-        read_decode_output(ioV, v_new, d, seq);
+        read_decode_output(ioQ, q, d, seq, dtype);
+        read_decode_output(ioK, k_new, d, seq, dtype);
+        read_decode_output(ioV, v_new, d, seq, dtype);
         CFRelease(ioQ); CFRelease(ioK); CFRelease(ioV);
 
         // Append K, V to cache
@@ -252,12 +247,12 @@ bool orion_ane_decode_step(const OrionGPT2Weights* w,
         free(attn_out);
 
         // === ANE decode_ffn: x → LN2 → FFN → residual → hidden ===
-        write_decode_input(ioInput, x, d, seq);
+        write_decode_input(ioInput, x, d, seq, dtype);
 
-        IOSurfaceRef ioFFNOut = make_f32_surface(count);
+        IOSurfaceRef ioFFNOut = orion_io_tensor_create(d, seq, dtype);
         IOSurfaceRef ffn_ins[]  = {ioInput};
         IOSurfaceRef ffn_outs[] = {ioFFNOut};
-        ok = orion_kernel_eval(&kDecodeFFN, layer, seq, &cfg,
+        ok = orion_kernel_eval(&ffn, layer, seq, &cfg,
                                blob_dir, &wb, ffn_ins, 1, ffn_outs, 1);
         if (!ok) {
             fprintf(stderr, "ANE decode: FFN L%d failed\n", layer);
@@ -267,7 +262,7 @@ bool orion_ane_decode_step(const OrionGPT2Weights* w,
         }
 
         // Extract hidden[0] → x for next layer
-        read_decode_output(ioFFNOut, x, d, seq);
+        read_decode_output(ioFFNOut, x, d, seq, dtype);
         CFRelease(ioFFNOut);
     }
 

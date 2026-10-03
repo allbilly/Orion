@@ -102,4 +102,10 @@ NSData* orion_make_causal_mask_blob(int seq_len);
 /// Return MIL-style blob path for causal mask: "@model_path/masks/causal_{seq_len}.bin"
 NSString* orion_causal_mask_path(int seq_len);
 
+/// Pack BLOBFILEs, relocating MIL chunk offsets and header payload offsets.
+/// Accepts generated MIL with arbitrary whitespace and complete blobs at offset 0.
+/// Rejects unsupported references or invalid chunk bounds; outputs change only on success.
+bool orion_mil_pack_weights(NSString* mil, NSDictionary* weights,
+                            NSString** packed_mil, NSDictionary** packed_weights);
+
 #endif // ORION_MIL_BUILDER_H

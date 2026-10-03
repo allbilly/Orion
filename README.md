@@ -75,6 +75,16 @@ Orion builds on foundational work by [maderix](https://github.com/maderix/ANE) (
 ./orion infer --prompt "Hello, world"                   # CPU-only baseline
 ```
 
+GPT-2 ANE inference probes the device and macOS runtime once at startup, checking
+compilation, evaluation and numerical output. It keeps FP32 program I/O with
+16-position decode padding where supported, and uses FP16 with 32-position
+padding otherwise. Weight packing is probed independently using GPT-2-sized
+projections. Buffers, output ordering, benchmarks and cache keys follow the same
+selected policy; no chip-name whitelist is required. The probes need no model
+files and consume a few compilations from the process's ANE compile budget.
+See [hardware validation and reproduction steps](docs/ane_io_validation.md) for
+tested configurations and pending M4/other-chip validation.
+
 ### Training
 
 ```bash

@@ -6,13 +6,20 @@
 #include <stdio.h>
 
 OrionGraph* orion_frontend_gpt2_decode_proj(int layer, const OrionModelConfig* cfg) {
+    return orion_frontend_gpt2_decode_proj_io(layer, cfg, ORION_IO_FP32);
+}
+
+OrionGraph* orion_frontend_gpt2_decode_proj_io(int layer, const OrionModelConfig* cfg, OrionIODtype dtype) {
+    OrionDtype io = dtype == ORION_IO_FP16 ? ORION_DTYPE_FP16 : ORION_DTYPE_FP32;
+    int (*cast_output)(OrionGraph*, int, const char*, int, int) =
+        dtype == ORION_IO_FP16 ? orion_pattern_cast_to_fp16 : orion_pattern_cast_to_fp32;
     int d   = cfg->d_model;
-    int seq = ORION_GRAPH_DECODE_SEQ;
+    int seq = orion_io_decode_seq(dtype);
     OrionGraph* g = orion_graph_create();
 
     // Input
     int in_shape[4] = {1, d, 1, seq};
-    int x = orion_gb_input(g, "x", ORION_DTYPE_FP32, in_shape);
+    int x = orion_gb_input(g, "x", io, in_shape);
     int x16 = orion_pattern_cast_to_fp16(g, x, "x16", d, seq);
 
     // LayerNorm 1
@@ -38,10 +45,10 @@ OrionGraph* orion_frontend_gpt2_decode_proj(int layer, const OrionModelConfig* c
     snprintf(bpath, sizeof(bpath), "@model_path/layer%d/bv.bin", layer);
     int v = orion_gb_linear(g, ln1, "v", d, d, seq, wpath, bpath);
 
-    // Cast to fp32
-    int q32 = orion_pattern_cast_to_fp32(g, q, "q32", d, seq);
-    int k32 = orion_pattern_cast_to_fp32(g, k, "k32", d, seq);
-    int v32 = orion_pattern_cast_to_fp32(g, v, "v32", d, seq);
+    // Select boundary dtype; fp16 identity casts are eliminated.
+    int q32 = cast_output(g, q, "q32", d, seq);
+    int k32 = cast_output(g, k, "k32", d, seq);
+    int v32 = cast_output(g, v, "v32", d, seq);
 
     // Outputs in alphabetical order: k32, q32, v32
     orion_gb_output(g, q32, "q32");
@@ -52,14 +59,21 @@ OrionGraph* orion_frontend_gpt2_decode_proj(int layer, const OrionModelConfig* c
 }
 
 OrionGraph* orion_frontend_gpt2_decode_ffn(int layer, const OrionModelConfig* cfg) {
+    return orion_frontend_gpt2_decode_ffn_io(layer, cfg, ORION_IO_FP32);
+}
+
+OrionGraph* orion_frontend_gpt2_decode_ffn_io(int layer, const OrionModelConfig* cfg, OrionIODtype dtype) {
+    OrionDtype io = dtype == ORION_IO_FP16 ? ORION_DTYPE_FP16 : ORION_DTYPE_FP32;
+    int (*cast_output)(OrionGraph*, int, const char*, int, int) =
+        dtype == ORION_IO_FP16 ? orion_pattern_cast_to_fp16 : orion_pattern_cast_to_fp32;
     int d   = cfg->d_model;
     int h   = cfg->hidden_dim;
-    int seq = ORION_GRAPH_DECODE_SEQ;
+    int seq = orion_io_decode_seq(dtype);
     OrionGraph* g = orion_graph_create();
 
     // Input
     int in_shape[4] = {1, d, 1, seq};
-    int x = orion_gb_input(g, "x", ORION_DTYPE_FP32, in_shape);
+    int x = orion_gb_input(g, "x", io, in_shape);
     int x16 = orion_pattern_cast_to_fp16(g, x, "x16", d, seq);
 
     // LayerNorm 2
@@ -81,7 +95,7 @@ OrionGraph* orion_frontend_gpt2_decode_ffn(int layer, const OrionModelConfig* cf
 
     // Residual + cast
     int resid = orion_pattern_residual(g, x16, ffn, "resid");
-    int hidden = orion_pattern_cast_to_fp32(g, resid, "hidden", d, seq);
+    int hidden = cast_output(g, resid, "hidden", d, seq);
 
     orion_gb_output(g, hidden, "hidden");
     return g;

@@ -4,11 +4,14 @@
 
 #include "../graph.h"
 #include "../model_config.h"
+#include "../../core/ane_io_types.h"
 
 // Build final LayerNorm graph.
 // Equivalent to orion_milgen_gpt2_final_ln.
 // Input:  fp32 [1, d_model, 1, bucket]
 // Output: fp32 [1, d_model, 1, bucket] "hidden"
 OrionGraph* orion_frontend_gpt2_final_ln(int bucket, const OrionModelConfig* cfg);
+// Explicit boundary format; the legacy entry point above keeps FP32.
+OrionGraph* orion_frontend_gpt2_final_ln_io(int bucket, const OrionModelConfig* cfg, OrionIODtype dtype);
 
 #endif // ORION_FRONTEND_GPT2_FINAL_H

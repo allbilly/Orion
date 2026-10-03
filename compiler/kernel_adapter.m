@@ -15,49 +15,43 @@ static struct {
 } s_registry[MAX_ADAPTED_KERNELS];
 static int s_registry_count = 0;
 
-// Direct API: generate MIL from a frontend function.
-// Builds graph -> validates -> optimizes -> codegen.
-NSString* orion_kernel_adapter_generate_mil(OrionFrontendFn frontend,
-                                             int layer_idx, int bucket,
-                                             const OrionModelConfig* cfg) {
-    OrionGraph* g = frontend(layer_idx, bucket, cfg);
+static NSString* generate_graph(OrionGraph* g) {
     if (!g) return nil;
-
-    // Validate
     OrionValidationResult vr = orion_graph_validate(g);
     if (!vr.valid) {
         NSLog(@"[kernel_adapter] validation failed: %s", vr.message);
         orion_graph_free(g);
         return nil;
     }
-
-    // Optimize
     orion_pipeline_optimize(g);
-
-    // Codegen
     NSString* mil = orion_codegen_mil(g, "main");
     orion_graph_free(g);
     return mil;
+}
+
+NSString* orion_kernel_adapter_generate_mil_io(OrionFrontendIOFn frontend,
+    int layer_idx, int bucket, const OrionModelConfig* cfg, OrionIODtype dtype) {
+    return generate_graph(frontend(layer_idx, bucket, cfg, dtype));
+}
+
+NSString* orion_kernel_adapter_generate_mil_2arg_io(OrionFrontend2IOFn frontend,
+    int layer_idx, const OrionModelConfig* cfg, OrionIODtype dtype) {
+    return generate_graph(frontend(layer_idx, cfg, dtype));
+}
+
+// Direct API: generate MIL from a frontend function.
+// Builds graph -> validates -> optimizes -> codegen.
+NSString* orion_kernel_adapter_generate_mil(OrionFrontendFn frontend,
+                                             int layer_idx, int bucket,
+                                             const OrionModelConfig* cfg) {
+    return generate_graph(frontend(layer_idx, bucket, cfg));
 }
 
 // Direct API: generate MIL from a 2-arg frontend (no bucket param).
 NSString* orion_kernel_adapter_generate_mil_2arg(OrionFrontend2Fn frontend,
                                                   int layer_idx,
                                                   const OrionModelConfig* cfg) {
-    OrionGraph* g = frontend(layer_idx, cfg);
-    if (!g) return nil;
-
-    OrionValidationResult vr = orion_graph_validate(g);
-    if (!vr.valid) {
-        NSLog(@"[kernel_adapter] validation failed: %s", vr.message);
-        orion_graph_free(g);
-        return nil;
-    }
-
-    orion_pipeline_optimize(g);
-    NSString* mil = orion_codegen_mil(g, "main");
-    orion_graph_free(g);
-    return mil;
+    return generate_graph(frontend(layer_idx, cfg));
 }
 
 // Registry-based generate_mil for use with OrionKernel.
@@ -86,5 +80,7 @@ OrionKernel orion_kernel_from_frontend(const char* name,
     k.build_wdict = wdict;
     k.n_inputs = n_inputs;
     k.n_outputs = n_outputs;
+    k.pack_weights = false;
+    k.io_dtype = ORION_IO_FP32;
     return k;
 }

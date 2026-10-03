@@ -27,6 +27,7 @@
 
 #import "core/ane_runtime.h"
 #import "core/iosurface_tensor.h"
+#import "core/ane_io.h"
 #import "core/mil_builder.h"
 #import "core/bucket.h"
 #import "model/configs/gpt2_124m.h"
@@ -47,37 +48,27 @@ static int g_pass = 0, g_fail = 0;
     else { g_fail++; printf("  FAIL: %s\n", msg); } \
 } while(0)
 
+static const OrionANEIO *io_policy;
+
 #pragma mark - IOSurface helpers
 
-static IOSurfaceRef make_f32_surface(int count, float val) {
-    size_t bytes = count * sizeof(float);
-    IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
-    IOSurfaceLock(s, 0, NULL);
-    float *p = (float *)IOSurfaceGetBaseAddress(s);
-    for (int i = 0; i < count; i++) p[i] = val;
-    IOSurfaceUnlock(s, 0, NULL);
-    return s;
+static IOSurfaceRef make_io_surface(int count, float val) {
+    IOSurfaceRef surface = orion_io_tensor_create(1, count, io_policy->dtype);
+    float *data = malloc(count * sizeof(float));
+    for (int i = 0; i < count; i++) data[i] = val;
+    orion_io_write_f32(surface, data, count, io_policy->dtype);
+    free(data);
+    return surface;
 }
 
-static IOSurfaceRef make_f32_surface_data(const float *data, int count) {
-    size_t bytes = count * sizeof(float);
-    IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
-    IOSurfaceLock(s, 0, NULL);
-    memcpy(IOSurfaceGetBaseAddress(s), data, bytes);
-    IOSurfaceUnlock(s, 0, NULL);
-    return s;
+static IOSurfaceRef make_io_surface_data(const float *data, int count) {
+    IOSurfaceRef surface = orion_io_tensor_create(1, count, io_policy->dtype);
+    orion_io_write_f32(surface, data, count, io_policy->dtype);
+    return surface;
 }
 
 static void read_f32_surface(IOSurfaceRef s, float *out, int count) {
-    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
-    memcpy(out, IOSurfaceGetBaseAddress(s), count * sizeof(float));
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    orion_io_read_f32(s, out, count, io_policy->dtype);
 }
 
 #pragma mark - Weight dict helpers
@@ -163,7 +154,7 @@ static void test_attn_prefill(void) {
     int count = d * seq;  // 24576 elements
 
     // Generate MIL text
-    NSString *mil = orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_attn, 0, seq, &kGPT2_124M);
+    NSString *mil = orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_attn_io, 0, seq, &kGPT2_124M, io_policy->dtype);
     CHECK(mil != nil && mil.length > 0, "MIL text generated");
 
     // Build weight dict
@@ -171,7 +162,7 @@ static void test_attn_prefill(void) {
     CHECK(wdict.count == 11, "weight dict has 11 entries (10 weights + mask)");
 
     // Compile
-    OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, "test_attn_L0");
+    OrionProgram *prog = orion_ane_io_compile(mil, wdict, io_policy, "test_attn_L0");
     CHECK(prog != NULL, "attention L0 compiles on ANE");
 
     if (prog) {
@@ -180,15 +171,16 @@ static void test_attn_prefill(void) {
         for (int i = 0; i < count; i++) {
             input[i] = sinf(i * 0.01f) * 0.1f;
         }
-        IOSurfaceRef ioIn = make_f32_surface_data(input, count);
+        IOSurfaceRef ioIn = make_io_surface_data(input, count);
 
         // Output surfaces
-        IOSurfaceRef ioHidden = make_f32_surface(count, 0.0f);
-        IOSurfaceRef ioK      = make_f32_surface(count, 0.0f);
-        IOSurfaceRef ioV      = make_f32_surface(count, 0.0f);
+        IOSurfaceRef ioHidden = make_io_surface(count, 0.0f);
+        IOSurfaceRef ioK      = make_io_surface(count, 0.0f);
+        IOSurfaceRef ioV      = make_io_surface(count, 0.0f);
 
         IOSurfaceRef ins[]  = {ioIn};
-        IOSurfaceRef outs[] = {ioHidden, ioK, ioV};
+        IOSurfaceRef outs[3];
+        orion_io_prefill_outputs(io_policy->dtype, ioHidden, ioK, ioV, outs);
         bool ok = orion_eval(prog, ins, 1, outs, 3);
         CHECK(ok, "attention L0 eval succeeds");
 
@@ -234,7 +226,7 @@ static void test_ffn_prefill(void) {
     int count = d * seq;
 
     // Generate MIL text
-    NSString *mil = orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_ffn, 0, seq, &kGPT2_124M);
+    NSString *mil = orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_ffn_io, 0, seq, &kGPT2_124M, io_policy->dtype);
     CHECK(mil != nil && mil.length > 0, "FFN MIL text generated");
 
     // Build weight dict
@@ -242,7 +234,7 @@ static void test_ffn_prefill(void) {
     CHECK(wdict.count == 6, "FFN weight dict has 6 entries");
 
     // Compile
-    OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, "test_ffn_L0");
+    OrionProgram *prog = orion_ane_io_compile(mil, wdict, io_policy, "test_ffn_L0");
     CHECK(prog != NULL, "FFN L0 compiles on ANE");
 
     if (prog) {
@@ -251,8 +243,8 @@ static void test_ffn_prefill(void) {
         for (int i = 0; i < count; i++) {
             input[i] = sinf(i * 0.01f) * 0.1f;
         }
-        IOSurfaceRef ioIn  = make_f32_surface_data(input, count);
-        IOSurfaceRef ioOut = make_f32_surface(count, 0.0f);
+        IOSurfaceRef ioIn  = make_io_surface_data(input, count);
+        IOSurfaceRef ioOut = make_io_surface(count, 0.0f);
 
         IOSurfaceRef ins[]  = {ioIn};
         IOSurfaceRef outs[] = {ioOut};
@@ -292,11 +284,11 @@ static void test_combined_layer(void) {
     NSMutableDictionary *ffn_dict  = build_ffn_weight_dict(0, "model/blobs/gpt2_124m");
 
     // Compile both programs
-    NSString *attn_mil = orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_attn, 0, seq, &kGPT2_124M);
-    NSString *ffn_mil  = orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_ffn, 0, seq, &kGPT2_124M);
+    NSString *attn_mil = orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_attn_io, 0, seq, &kGPT2_124M, io_policy->dtype);
+    NSString *ffn_mil  = orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_ffn_io, 0, seq, &kGPT2_124M, io_policy->dtype);
 
-    OrionProgram *attn_prog = orion_compile_mil(attn_mil.UTF8String, attn_dict, "comb_attn_L0");
-    OrionProgram *ffn_prog  = orion_compile_mil(ffn_mil.UTF8String, ffn_dict, "comb_ffn_L0");
+    OrionProgram *attn_prog = orion_ane_io_compile(attn_mil, attn_dict, io_policy, "comb_attn_L0");
+    OrionProgram *ffn_prog  = orion_ane_io_compile(ffn_mil, ffn_dict, io_policy, "comb_ffn_L0");
 
     CHECK(attn_prog && ffn_prog, "both L0 programs compile");
 
@@ -309,18 +301,19 @@ static void test_combined_layer(void) {
         }
 
         // Step 1: Attention
-        IOSurfaceRef ioIn     = make_f32_surface_data(input, count);
-        IOSurfaceRef ioHidden = make_f32_surface(count, 0.0f);
-        IOSurfaceRef ioK      = make_f32_surface(count, 0.0f);
-        IOSurfaceRef ioV      = make_f32_surface(count, 0.0f);
+        IOSurfaceRef ioIn     = make_io_surface_data(input, count);
+        IOSurfaceRef ioHidden = make_io_surface(count, 0.0f);
+        IOSurfaceRef ioK      = make_io_surface(count, 0.0f);
+        IOSurfaceRef ioV      = make_io_surface(count, 0.0f);
 
         IOSurfaceRef attn_ins[]  = {ioIn};
-        IOSurfaceRef attn_outs[] = {ioHidden, ioK, ioV};
+        IOSurfaceRef attn_outs[3];
+        orion_io_prefill_outputs(io_policy->dtype, ioHidden, ioK, ioV, attn_outs);
         bool ok1 = orion_eval(attn_prog, attn_ins, 1, attn_outs, 3);
         CHECK(ok1, "attention eval succeeds");
 
         // Step 2: FFN (takes attention output as input)
-        IOSurfaceRef ioFFNOut = make_f32_surface(count, 0.0f);
+        IOSurfaceRef ioFFNOut = make_io_surface(count, 0.0f);
         IOSurfaceRef ffn_ins[]  = {ioHidden};
         IOSurfaceRef ffn_outs[] = {ioFFNOut};
         bool ok2 = orion_eval(ffn_prog, ffn_ins, 1, ffn_outs, 1);
@@ -387,17 +380,18 @@ static void test_ane_vs_cpu(void) {
 
     // Compile and run attention on ANE
     NSMutableDictionary *wdict = build_attn_weight_dict(0, seq, "model/blobs/gpt2_124m");
-    NSString *mil = orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_attn, 0, seq, &kGPT2_124M);
-    OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, "cmp_attn_L0");
+    NSString *mil = orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_attn_io, 0, seq, &kGPT2_124M, io_policy->dtype);
+    OrionProgram *prog = orion_ane_io_compile(mil, wdict, io_policy, "cmp_attn_L0");
 
     if (prog) {
-        IOSurfaceRef ioIn     = make_f32_surface_data(ane_input, count);
-        IOSurfaceRef ioHidden = make_f32_surface(count, 0.0f);
-        IOSurfaceRef ioK      = make_f32_surface(count, 0.0f);
-        IOSurfaceRef ioV      = make_f32_surface(count, 0.0f);
+        IOSurfaceRef ioIn     = make_io_surface_data(ane_input, count);
+        IOSurfaceRef ioHidden = make_io_surface(count, 0.0f);
+        IOSurfaceRef ioK      = make_io_surface(count, 0.0f);
+        IOSurfaceRef ioV      = make_io_surface(count, 0.0f);
 
         IOSurfaceRef ins[]  = {ioIn};
-        IOSurfaceRef outs[] = {ioHidden, ioK, ioV};
+        IOSurfaceRef outs[3];
+        orion_io_prefill_outputs(io_policy->dtype, ioHidden, ioK, ioV, outs);
         bool ok = orion_eval(prog, ins, 1, outs, 3);
 
         if (ok) {
@@ -653,6 +647,9 @@ int main(int argc, char **argv) {
             printf("Results: %d passed, %d failed\n", g_pass, g_fail);
             return g_fail > 0 ? 1 : 0;
         }
+
+        io_policy = orion_ane_io_policy();
+        if (!io_policy) return 1;
 
         // T047: attention prefill
         test_attn_prefill();

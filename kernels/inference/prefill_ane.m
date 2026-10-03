@@ -19,30 +19,6 @@
 // T052: ANE prefill runner
 // T053: K,V extraction from ANE output into KV cache
 
-#pragma mark - IOSurface Helpers
-
-static IOSurfaceRef make_f32_surface(int count) {
-    size_t bytes = count * sizeof(float);
-    return IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
-}
-
-static IOSurfaceRef make_f32_surface_data(const float *data, int count) {
-    IOSurfaceRef s = make_f32_surface(count);
-    IOSurfaceLock(s, 0, NULL);
-    memcpy(IOSurfaceGetBaseAddress(s), data, count * sizeof(float));
-    IOSurfaceUnlock(s, 0, NULL);
-    return s;
-}
-
-static void read_f32_surface(IOSurfaceRef s, float *out, int count) {
-    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
-    memcpy(out, IOSurfaceGetBaseAddress(s), count * sizeof(float));
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
-}
-
 #pragma mark - Weight Dict Helpers
 
 static void add_blob(NSMutableDictionary *dict, NSString *mil_path, NSString *file_path) {
@@ -102,16 +78,18 @@ static NSDictionary* build_final_ln_wdict(NSString *dir) {
 
 // Compiler MIL gen adapters — call frontend → validate → optimize → codegen
 static NSString* compiler_prefill_attn_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
-    return orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_attn, layer_idx, bucket, cfg);
+    return orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_attn_io,
+        layer_idx, bucket, cfg, orion_ane_io_policy()->dtype);
 }
 
 static NSString* compiler_prefill_ffn_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
-    return orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_ffn, layer_idx, bucket, cfg);
+    return orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_ffn_io,
+        layer_idx, bucket, cfg, orion_ane_io_policy()->dtype);
 }
 
 static NSString* compiler_final_ln_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
     (void)layer_idx;
-    OrionGraph* g = orion_frontend_gpt2_final_ln(bucket, cfg);
+    OrionGraph* g = orion_frontend_gpt2_final_ln_io(bucket, cfg, orion_ane_io_policy()->dtype);
     if (!g) return nil;
     OrionValidationResult vr = orion_graph_validate(g);
     if (!vr.valid) { orion_graph_free(g); return nil; }
@@ -163,6 +141,9 @@ static const OrionKernel kPrefillFinalLN = {
 IOSurfaceRef orion_prepare_ane_input(const OrionGPT2Weights* w,
                                       const int* tokens, int prompt_len,
                                       int bucket, const OrionModelConfig* cfg) {
+    const OrionANEIO *policy = orion_ane_io_policy();
+    if (!policy) return NULL;
+    OrionIODtype dtype = policy->dtype;
     int d = cfg->d_model;
     int count = d * bucket;
 
@@ -184,7 +165,8 @@ IOSurfaceRef orion_prepare_ane_input(const OrionGPT2Weights* w,
         }
     }
 
-    IOSurfaceRef surface = make_f32_surface_data(ane_data, count);
+    IOSurfaceRef surface = orion_io_tensor_create(d, bucket, dtype);
+    orion_io_write_f32(surface, ane_data, count, dtype);
 
     free(cpu_embed);
     free(ane_data);
@@ -238,6 +220,12 @@ bool orion_ane_prefill(const OrionGPT2Weights* w,
                         const char* blob_dir,
                         OrionKVCache* kv,
                         float* logits) {
+    const OrionANEIO *policy = orion_ane_io_policy();
+    if (!policy) return false;
+    OrionIODtype dtype = policy->dtype;
+    OrionKernel attn = kPrefillAttn, ffn = kPrefillFFN, final_ln = kPrefillFinalLN;
+    attn.io_dtype = ffn.io_dtype = final_ln.io_dtype = dtype;
+    attn.pack_weights = ffn.pack_weights = final_ln.pack_weights = policy->pack_weights;
     int d = cfg->d_model;
     int n_layer = cfg->n_layer;
     int vocab = cfg->vocab;
@@ -263,13 +251,14 @@ bool orion_ane_prefill(const OrionGPT2Weights* w,
     // Compile and run 12 layers of (attention + FFN)
     for (int layer = 0; layer < n_layer; layer++) {
         // --- Attention: 1 input → 3 outputs (hidden, K, V) ---
-        IOSurfaceRef ioAttnOut = make_f32_surface(count);
-        IOSurfaceRef ioK       = make_f32_surface(count);
-        IOSurfaceRef ioV       = make_f32_surface(count);
+        IOSurfaceRef ioAttnOut = orion_io_tensor_create(d, bucket, dtype);
+        IOSurfaceRef ioK       = orion_io_tensor_create(d, bucket, dtype);
+        IOSurfaceRef ioV       = orion_io_tensor_create(d, bucket, dtype);
 
         IOSurfaceRef attn_ins[]  = {ioHidden};
-        IOSurfaceRef attn_outs[] = {ioAttnOut, ioK, ioV};
-        bool ok = orion_kernel_eval(&kPrefillAttn, layer, bucket, cfg,
+        IOSurfaceRef attn_outs[3];
+        orion_io_prefill_outputs(dtype, ioAttnOut, ioK, ioV, attn_outs);
+        bool ok = orion_kernel_eval(&attn, layer, bucket, cfg,
                                     blob_dir, &wb, attn_ins, 1, attn_outs, 3);
         if (!ok) {
             fprintf(stderr, "ANE prefill: attention L%d failed\n", layer);
@@ -280,8 +269,8 @@ bool orion_ane_prefill(const OrionGPT2Weights* w,
         // T053: Extract K,V into cache
         float *k_data = (float *)malloc(count * sizeof(float));
         float *v_data = (float *)malloc(count * sizeof(float));
-        read_f32_surface(ioK, k_data, count);
-        read_f32_surface(ioV, v_data, count);
+        orion_io_read_f32(ioK, k_data, count, dtype);
+        orion_io_read_f32(ioV, v_data, count, dtype);
         extract_kv_to_cache(k_data, v_data, layer, prompt_len, bucket, kv, cfg);
         free(k_data); free(v_data);
 
@@ -292,10 +281,10 @@ bool orion_ane_prefill(const OrionGPT2Weights* w,
         ioHidden = ioAttnOut;
 
         // --- FFN ---
-        IOSurfaceRef ioFFNOut = make_f32_surface(count);
+        IOSurfaceRef ioFFNOut = orion_io_tensor_create(d, bucket, dtype);
         IOSurfaceRef ffn_ins[]  = {ioHidden};
         IOSurfaceRef ffn_outs[] = {ioFFNOut};
-        ok = orion_kernel_eval(&kPrefillFFN, layer, bucket, cfg,
+        ok = orion_kernel_eval(&ffn, layer, bucket, cfg,
                                blob_dir, &wb, ffn_ins, 1, ffn_outs, 1);
         if (!ok) {
             fprintf(stderr, "ANE prefill: FFN L%d failed\n", layer);
@@ -308,10 +297,10 @@ bool orion_ane_prefill(const OrionGPT2Weights* w,
     }
 
     // Final LayerNorm on ANE
-    IOSurfaceRef ioLNOut = make_f32_surface(count);
+    IOSurfaceRef ioLNOut = orion_io_tensor_create(d, bucket, dtype);
     IOSurfaceRef ln_ins[]  = {ioHidden};
     IOSurfaceRef ln_outs[] = {ioLNOut};
-    bool ok = orion_kernel_eval(&kPrefillFinalLN, -1, bucket, cfg,
+    bool ok = orion_kernel_eval(&final_ln, -1, bucket, cfg,
                                 blob_dir, &wb, ln_ins, 1, ln_outs, 1);
     CFRelease(ioHidden);
 
@@ -323,7 +312,7 @@ bool orion_ane_prefill(const OrionGPT2Weights* w,
 
     // Read final LN output (ANE layout [d_model, bucket])
     float *ln_out_ane = (float *)malloc(count * sizeof(float));
-    read_f32_surface(ioLNOut, ln_out_ane, count);
+    orion_io_read_f32(ioLNOut, ln_out_ane, count, dtype);
     CFRelease(ioLNOut);
 
     // Extract last prompt position in CPU layout

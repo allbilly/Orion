@@ -18,7 +18,7 @@
 /// @param prompt_len Number of prompt tokens
 /// @param bucket     Bucket size to pad to
 /// @param cfg        Model configuration
-/// @return IOSurface containing fp32 [1, d_model, 1, bucket] tensor. Caller must CFRelease.
+/// @return IOSurface in the runtime-selected I/O dtype, shaped [1, d_model, 1, bucket]. Caller must CFRelease.
 IOSurfaceRef orion_prepare_ane_input(const OrionGPT2Weights* w,
                                       const int* tokens, int prompt_len,
                                       int bucket, const OrionModelConfig* cfg);

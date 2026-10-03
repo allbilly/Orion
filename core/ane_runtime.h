@@ -35,6 +35,11 @@ OrionProgram* orion_compile_mil(
     const char* program_tag
 );
 
+/// Capability probes expect unsupported programs to fail. Suppress their
+/// compile diagnostics while retaining normal compilation and cleanup behavior.
+OrionProgram* orion_compile_mil_probe(const char* mil_text, NSDictionary* weight_dict,
+                                     const char* program_tag);
+
 /// Evaluate a compiled ANE program.
 /// @param prog        Compiled program handle
 /// @param inputs      Array of input IOSurface tensors

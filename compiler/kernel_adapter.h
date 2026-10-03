@@ -13,6 +13,15 @@ typedef OrionGraph* (*OrionFrontendFn)(int layer_idx, int bucket, const OrionMod
 // Frontend function type for kernels that don't use bucket (2-arg: layer, cfg).
 typedef OrionGraph* (*OrionFrontend2Fn)(int layer_idx, const OrionModelConfig* cfg);
 
+typedef OrionGraph* (*OrionFrontendIOFn)(int layer_idx, int bucket,
+                                        const OrionModelConfig* cfg, OrionIODtype dtype);
+typedef OrionGraph* (*OrionFrontend2IOFn)(int layer_idx,
+                                         const OrionModelConfig* cfg, OrionIODtype dtype);
+NSString* orion_kernel_adapter_generate_mil_io(OrionFrontendIOFn frontend,
+    int layer_idx, int bucket, const OrionModelConfig* cfg, OrionIODtype dtype);
+NSString* orion_kernel_adapter_generate_mil_2arg_io(OrionFrontend2IOFn frontend,
+    int layer_idx, const OrionModelConfig* cfg, OrionIODtype dtype);
+
 // Direct API: generate MIL from a 3-arg frontend function.
 // Builds graph -> validates -> optimizes -> codegen.
 NSString* orion_kernel_adapter_generate_mil(OrionFrontendFn frontend,

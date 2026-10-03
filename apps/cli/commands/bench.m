@@ -5,6 +5,7 @@
 #import <sys/time.h>
 #import <mach/mach.h>
 #import "../../../core/ane_runtime.h"
+#import "../../../core/ane_io.h"
 #import "../../../core/ane_program_cache.h"
 #import "../../../core/iosurface_tensor.h"
 #import "../../../core/profiler.h"
@@ -50,13 +51,6 @@ static size_t get_rss_bytes(void) {
     return 0;
 }
 
-static IOSurfaceRef make_f32_surface(int count) {
-    size_t bytes = count * sizeof(float);
-    return IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
-}
 
 static int cmp_double(const void *a, const void *b) {
     double da = *(const double *)a;
@@ -329,52 +323,32 @@ static int bench_swap(const char* weights_a, const char* weights_b,
         return 1;
     }
 
+    const OrionANEIO *policy = orion_ane_io_policy();
+    if (!policy) return 1;
+    OrionIODtype dtype = policy->dtype;
     int ch = 256, sp = bucket;
-    char mil[2048];
-    snprintf(mil, sizeof(mil),
-        "program(1.3)\n"
-        "[buildInfo = dict<string, string>({"
-        "{\"coremlc-component-MIL\", \"3510.2.1\"}, "
-        "{\"coremlc-version\", \"3505.4.1\"}, "
-        "{\"coremltools-component-milinternal\", \"\"}, "
-        "{\"coremltools-version\", \"9.0\"}"
-        "})]\n"
-        "{\n"
-        "    func main<ios18>(tensor<fp32, [1, %d, 1, %d]> x, tensor<fp32, [1, %d, 1, %d]> y) {\n"
-        "        string to16 = const()[name = string(\"to16\"), val = string(\"fp16\")];\n"
-        "        tensor<fp16, [1, %d, 1, %d]> x16 = cast(dtype = to16, x = x)[name = string(\"cx\")];\n"
-        "        tensor<fp16, [1, %d, 1, %d]> y16 = cast(dtype = to16, x = y)[name = string(\"cy\")];\n"
-        "        tensor<fp16, [1, %d, 1, %d]> z16 = add(x = x16, y = y16)[name = string(\"add_op\")];\n"
-        "        string to32 = const()[name = string(\"to32\"), val = string(\"fp32\")];\n"
-        "        tensor<fp32, [1, %d, 1, %d]> z = cast(dtype = to32, x = z16)[name = string(\"out\")];\n"
-        "    } -> (z);\n"
-        "}\n",
-        ch, sp, ch, sp, ch, sp, ch, sp, ch, sp, ch, sp);
-
+    NSString *type = dtype == ORION_IO_FP16 ? @"fp16" : @"fp32";
+    NSString *body = [NSString stringWithFormat:
+        @"        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n"
+         "        tensor<fp16, [1,%d,1,%d]> x16 = cast(dtype=to16, x=x)[name=string(\"cx\")];\n"
+         "        tensor<fp16, [1,%d,1,%d]> y16 = cast(dtype=to16, x=y)[name=string(\"cy\")];\n"
+         "        tensor<fp16, [1,%d,1,%d]> z16 = add(x=x16, y=y16)[name=string(\"add_op\")];\n"
+         "        string to_io = const()[name=string(\"to_io\"), val=string(\"%@\")];\n"
+         "        tensor<%@, [1,%d,1,%d]> z = cast(dtype=to_io, x=z16)[name=string(\"out\")];\n",
+        ch, sp, ch, sp, ch, sp, type, type, ch, sp];
+    NSString *mil = orion_mil_program_multi(body,
+        @[[NSString stringWithFormat:@"tensor<%@, [1,%d,1,%d]> x", type, ch, sp],
+          [NSString stringWithFormat:@"tensor<%@, [1,%d,1,%d]> y", type, ch, sp]], @[@"z"]);
     int count = ch * sp;
-    size_t bytes = count * sizeof(float);
-    IOSurfaceRef ioX = IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
-    IOSurfaceRef ioY = IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
-    IOSurfaceRef ioZ = IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes), (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1, (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes), (id)kIOSurfacePixelFormat: @0});
-
-    IOSurfaceLock(ioX, 0, NULL);
-    float *px = IOSurfaceGetBaseAddress(ioX);
-    for (int i = 0; i < count; i++) px[i] = 1.0f;
-    IOSurfaceUnlock(ioX, 0, NULL);
-
-    IOSurfaceLock(ioY, 0, NULL);
-    float *py = IOSurfaceGetBaseAddress(ioY);
-    for (int i = 0; i < count; i++) py[i] = 2.0f;
-    IOSurfaceUnlock(ioY, 0, NULL);
+    IOSurfaceRef ioX = orion_io_tensor_create(ch, sp, dtype);
+    IOSurfaceRef ioY = orion_io_tensor_create(ch, sp, dtype);
+    IOSurfaceRef ioZ = orion_io_tensor_create(ch, sp, dtype);
+    float *data = malloc(count * sizeof(float));
+    for (int i = 0; i < count; i++) data[i] = 1.0f;
+    orion_io_write_f32(ioX, data, count, dtype);
+    for (int i = 0; i < count; i++) data[i] = 2.0f;
+    orion_io_write_f32(ioY, data, count, dtype);
+    free(data);
 
     size_t rss_start = get_rss_bytes();
     double total_compile_ms = 0, total_eval_ms = 0, total_evict_ms = 0;
@@ -395,7 +369,7 @@ static int bench_swap(const char* weights_a, const char* weights_b,
         OrionProgram *prog = orion_cache_lookup("bench_add", 0, &wb);
         bool was_hit = (prog != NULL);
         if (!prog) {
-            prog = orion_compile_mil(mil, @{}, "bench_add");
+            prog = orion_compile_mil(mil.UTF8String, @{}, "bench_add");
             if (!prog) {
                 fprintf(stderr, "bench swap: compile failed at iter %d\n", i);
                 CFRelease(ioX); CFRelease(ioY); CFRelease(ioZ);
@@ -501,11 +475,14 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
         return 1;
     }
 
+    const OrionANEIO *policy = orion_ane_io_policy();
+    if (!policy) return 1;
+    OrionIODtype dtype = policy->dtype;
     NSString *dir = @(model_dir);
     const OrionModelConfig *cfg = &kGPT2_124M;
     int d = cfg->d_model;         // 768
     int hd = cfg->hidden_dim;     // 3072
-    int decode_seq = ORION_GRAPH_DECODE_SEQ;  // 16
+    int decode_seq = orion_io_decode_seq(dtype);
 
     // Verify weights exist
     NSString *check = [NSString stringWithFormat:@"%@/layer0/ln1_g.bin", dir];
@@ -524,32 +501,32 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
 
     // Prefill buffer sizes: [1, d_model, 1, bucket]
     int prefill_count = d * bucket;
-    size_t prefill_bytes = prefill_count * sizeof(float);
+    size_t prefill_bytes = prefill_count * orion_io_element_size(dtype);
 
-    IOSurfaceRef ioPrefillIn = make_f32_surface(prefill_count);
-    IOSurfaceRef ioPrefillOut1 = make_f32_surface(prefill_count);
-    IOSurfaceRef ioPrefillOut2 = make_f32_surface(prefill_count);
-    IOSurfaceRef ioPrefillOut3 = make_f32_surface(prefill_count);
+    IOSurfaceRef ioPrefillIn = orion_io_tensor_create(d, bucket, dtype);
+    IOSurfaceRef ioPrefillOut1 = orion_io_tensor_create(d, bucket, dtype);
+    IOSurfaceRef ioPrefillOut2 = orion_io_tensor_create(d, bucket, dtype);
+    IOSurfaceRef ioPrefillOut3 = orion_io_tensor_create(d, bucket, dtype);
 
     // Fill input with small values
-    IOSurfaceLock(ioPrefillIn, 0, NULL);
-    float *p = IOSurfaceGetBaseAddress(ioPrefillIn);
+    float *p = malloc(prefill_count * sizeof(float));
     for (int i = 0; i < prefill_count; i++) p[i] = 0.01f * (i % 100);
-    IOSurfaceUnlock(ioPrefillIn, 0, NULL);
+    orion_io_write_f32(ioPrefillIn, p, prefill_count, dtype);
+    free(p);
 
     // Decode buffer sizes: [1, d_model, 1, ORION_DECODE_SEQ]
     int decode_count = d * decode_seq;
-    size_t decode_bytes = decode_count * sizeof(float);
+    size_t decode_bytes = decode_count * orion_io_element_size(dtype);
 
-    IOSurfaceRef ioDecodeIn = make_f32_surface(decode_count);
-    IOSurfaceRef ioDecodeOut1 = make_f32_surface(decode_count);
-    IOSurfaceRef ioDecodeOut2 = make_f32_surface(decode_count);
-    IOSurfaceRef ioDecodeOut3 = make_f32_surface(decode_count);
+    IOSurfaceRef ioDecodeIn = orion_io_tensor_create(d, decode_seq, dtype);
+    IOSurfaceRef ioDecodeOut1 = orion_io_tensor_create(d, decode_seq, dtype);
+    IOSurfaceRef ioDecodeOut2 = orion_io_tensor_create(d, decode_seq, dtype);
+    IOSurfaceRef ioDecodeOut3 = orion_io_tensor_create(d, decode_seq, dtype);
 
-    IOSurfaceLock(ioDecodeIn, 0, NULL);
-    float *pd = IOSurfaceGetBaseAddress(ioDecodeIn);
+    float *pd = malloc(decode_count * sizeof(float));
     for (int i = 0; i < decode_count; i++) pd[i] = 0.01f * (i % 100);
-    IOSurfaceUnlock(ioDecodeIn, 0, NULL);
+    orion_io_write_f32(ioDecodeIn, pd, decode_count, dtype);
+    free(pd);
 
     // Kernel definitions: name, mil, wdict, ins, n_in, outs, n_out, weight size estimate
     struct {
@@ -567,10 +544,11 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
 
     // 1. prefill_attn — Layer 0, 1 input → 3 outputs
     IOSurfaceRef pa_ins[] = {ioPrefillIn};
-    IOSurfaceRef pa_outs[] = {ioPrefillOut1, ioPrefillOut2, ioPrefillOut3};
+    IOSurfaceRef pa_outs[3];
+    orion_io_prefill_outputs(dtype, ioPrefillOut1, ioPrefillOut2, ioPrefillOut3, pa_outs);
     kernels[0] = (typeof(kernels[0])){
         .name = "prefill_attn_L0",
-        .mil = orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_attn, 0, bucket, cfg),
+        .mil = orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_attn_io, 0, bucket, cfg, dtype),
         .wdict = build_attn_wdict(0, bucket, dir),
         .ins = pa_ins, .n_in = 1, .outs = pa_outs, .n_out = 3,
         .in_bytes = prefill_bytes, .out_bytes = 3 * prefill_bytes,
@@ -582,7 +560,7 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
     IOSurfaceRef pf_outs[] = {ioPrefillOut1};
     kernels[1] = (typeof(kernels[1])){
         .name = "prefill_ffn_L0",
-        .mil = orion_kernel_adapter_generate_mil(orion_frontend_gpt2_prefill_ffn, 0, bucket, cfg),
+        .mil = orion_kernel_adapter_generate_mil_io(orion_frontend_gpt2_prefill_ffn_io, 0, bucket, cfg, dtype),
         .wdict = build_ffn_wdict(0, dir),
         .ins = pf_ins, .n_in = 1, .outs = pf_outs, .n_out = 1,
         .in_bytes = prefill_bytes, .out_bytes = prefill_bytes,
@@ -595,7 +573,7 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
     kernels[2] = (typeof(kernels[2])){
         .name = "final_ln",
         .mil = ({
-            OrionGraph *_g = orion_frontend_gpt2_final_ln(bucket, cfg);
+            OrionGraph *_g = orion_frontend_gpt2_final_ln_io(bucket, cfg, dtype);
             orion_graph_validate(_g);
             orion_pipeline_optimize(_g);
             NSString *_m = orion_codegen_mil(_g, "main");
@@ -608,24 +586,24 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
         .w_bytes = (size_t)(2 * d) * sizeof(float),
     };
 
-    // 4. decode_proj — Layer 0, seq=16, 1 input → 3 outputs
+    // 4. decode_proj — Layer 0, selected decode stride, 1 input → 3 outputs
     IOSurfaceRef dp_ins[] = {ioDecodeIn};
-    IOSurfaceRef dp_outs[] = {ioDecodeOut1, ioDecodeOut2, ioDecodeOut3};
+    IOSurfaceRef dp_outs[] = {ioDecodeOut2, ioDecodeOut1, ioDecodeOut3};
     kernels[3] = (typeof(kernels[3])){
         .name = "decode_proj_L0",
-        .mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_proj, 0, cfg),
+        .mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_proj_io, 0, cfg, dtype),
         .wdict = build_decode_proj_wdict(0, dir),
         .ins = dp_ins, .n_in = 1, .outs = dp_outs, .n_out = 3,
         .in_bytes = decode_bytes, .out_bytes = 3 * decode_bytes,
         .w_bytes = (size_t)(3 * d * d + 5 * d) * sizeof(float),
     };
 
-    // 5. decode_ffn — Layer 0, seq=16, 1 input → 1 output
+    // 5. decode_ffn — Layer 0, selected decode stride, 1 input → 1 output
     IOSurfaceRef df_ins[] = {ioDecodeIn};
     IOSurfaceRef df_outs[] = {ioDecodeOut1};
     kernels[4] = (typeof(kernels[4])){
         .name = "decode_ffn_L0",
-        .mil = orion_kernel_adapter_generate_mil_2arg(orion_frontend_gpt2_decode_ffn, 0, cfg),
+        .mil = orion_kernel_adapter_generate_mil_2arg_io(orion_frontend_gpt2_decode_ffn_io, 0, cfg, dtype),
         .wdict = build_decode_ffn_wdict(0, dir),
         .ins = df_ins, .n_in = 1, .outs = df_outs, .n_out = 1,
         .in_bytes = decode_bytes, .out_bytes = decode_bytes,
@@ -636,8 +614,8 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
     for (int k = 0; k < 5; k++) {
         // Compile
         double tc0 = time_ms();
-        OrionProgram *prog = orion_compile_mil(
-            kernels[k].mil.UTF8String, kernels[k].wdict, kernels[k].name);
+        OrionProgram *prog = orion_ane_io_compile(
+            kernels[k].mil, kernels[k].wdict, policy, kernels[k].name);
         double compile_t = time_ms() - tc0;
 
         if (!prog) {
@@ -680,8 +658,10 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
             // JSONL to stdout for machine consumption
             printf("{\"kernel\":\"%s\",\"compile_ms\":%.2f,\"eval_min_ms\":%.4f,"
                    "\"eval_p50_ms\":%.4f,\"eval_p90_ms\":%.4f,\"eval_avg_ms\":%.4f,"
-                   "\"sram_est_mb\":%.1f}\n",
-                   kernels[k].name, compile_t, min_val, p50, p90, avg, sram_mb);
+                   "\"sram_est_mb\":%.1f,\"io_dtype\":\"%s\",\"decode_seq\":%d,\"pack_weights\":%s}\n",
+                   kernels[k].name, compile_t, min_val, p50, p90, avg, sram_mb,
+                   dtype == ORION_IO_FP16 ? "fp16" : "fp32", decode_seq,
+                   policy->pack_weights ? "true" : "false");
 
             results[n_results] = (KernelResult){
                 .name = kernels[k].name, .compile_ms = compile_t,

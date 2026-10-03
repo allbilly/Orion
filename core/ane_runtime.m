@@ -48,10 +48,10 @@ bool orion_ane_init(void) {
 
 #pragma mark - T015: Compile
 
-OrionProgram* orion_compile_mil(
+static OrionProgram* compile_mil(
     const char* mil_text,
     NSDictionary* weight_dict,
-    const char* program_tag
+    const char* program_tag, bool diagnostics
 ) {
     if (!g_init || !mil_text) return NULL;
 
@@ -99,7 +99,7 @@ OrionProgram* orion_compile_mil(
         BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
             model, @selector(compileWithQoS:options:error:), 21, @{}, &e);
         if (!ok) {
-            if (e) NSLog(@"ANE compile error: %@", e);
+            if (e && diagnostics) NSLog(@"ANE compile error: %@", e);
             [fm removeItemAtPath:tmpDir error:nil];
             return NULL;
         }
@@ -125,6 +125,16 @@ OrionProgram* orion_compile_mil(
 
         return prog;
     }
+}
+
+OrionProgram* orion_compile_mil(const char* mil_text, NSDictionary* weight_dict,
+                               const char* program_tag) {
+    return compile_mil(mil_text, weight_dict, program_tag, true);
+}
+
+OrionProgram* orion_compile_mil_probe(const char* mil_text, NSDictionary* weight_dict,
+                                     const char* program_tag) {
+    return compile_mil(mil_text, weight_dict, program_tag, false);
 }
 
 #pragma mark - T016: Eval

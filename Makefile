@@ -14,6 +14,7 @@ BUILDDIR = build
 
 CORE_SRC = \
 	core/ane_runtime.m \
+	core/ane_io.m \
 	core/ane_program_cache.m \
 	core/mil_builder.m \
 	core/iosurface_tensor.m \
@@ -112,6 +113,8 @@ TEST_NAMES = \
 	test_infer_golden_ane \
 	test_bench_decode \
 	test_delta_compile \
+	test_weight_pack \
+	test_ane_io \
 	test_lora
 
 # Compiler tests (link with compiler objects, not full library)
