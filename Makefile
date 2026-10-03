@@ -7,6 +7,7 @@ FRAMEWORKS = -framework Foundation -framework IOSurface -framework Accelerate
 LDFLAGS  = -ldl $(FRAMEWORKS)
 
 BUILDDIR = build
+.DEFAULT_GOAL := all
 
 # ---------------------------------------------------------------------------
 # Source files (38 total: 24 runtime + 14 compiler)
@@ -32,6 +33,8 @@ INFERENCE_SRC = \
 	kernels/inference/decode_cpu.m \
 	kernels/inference/kv_cache.m
 
+INFERENCE_SRC += kernels/inference/qwen35.m
+
 TRAINING_SRC = \
 	kernels/training/stories_train.m \
 	kernels/training/stories_cpu_ops.m \
@@ -47,6 +50,8 @@ CLI_SRC = \
 	apps/cli/commands/infer.m \
 	apps/cli/commands/train.m \
 	apps/cli/commands/bench.m
+
+CLI_SRC += apps/cli/commands/infer_qwen35.m
 
 # Stage 2: Compiler sources (pure C + ObjC for codegen/adapter)
 COMPILER_C_SRC = \
@@ -66,6 +71,7 @@ COMPILER_C_SRC = \
 	compiler/frontends/gpt2_prefill.c \
 	compiler/frontends/gpt2_decode.c \
 	compiler/frontends/gpt2_final.c \
+	compiler/frontends/qwen35.c \
 	compiler/frontends/classifier_softmax.c \
 	compiler/frontends/stories_train.c \
 	compiler/frontends/lora.c
@@ -125,6 +131,7 @@ COMPILER_TEST_NAMES = \
 	test_compiler_equiv
 
 TEST_BINS = $(patsubst %,$(BUILDDIR)/tests/%,$(TEST_NAMES))
+TEST_BINS += $(BUILDDIR)/tests/test_qwen35
 COMPILER_TEST_BINS = $(patsubst %,$(BUILDDIR)/tests/%,$(COMPILER_TEST_NAMES))
 
 # ---------------------------------------------------------------------------
@@ -132,6 +139,14 @@ COMPILER_TEST_BINS = $(patsubst %,$(BUILDDIR)/tests/%,$(COMPILER_TEST_NAMES))
 # ---------------------------------------------------------------------------
 
 .PHONY: all clean test test-compiler bench
+
+# Full-model tests require an export with --reference; fail if it is absent.
+QWEN35_WEIGHTS ?= model/blobs/qwen35_0_8b
+.PHONY: test-qwen35
+test-qwen35: $(BUILDDIR)/tests/test_qwen35 $(BUILDDIR)/tests/test_qwen35_full
+	$(BUILDDIR)/tests/test_qwen35
+	$(BUILDDIR)/tests/test_qwen35_full $(QWEN35_WEIGHTS)
+	$(BUILDDIR)/tests/test_qwen35_full $(QWEN35_WEIGHTS) --ane
 
 all: orion
 

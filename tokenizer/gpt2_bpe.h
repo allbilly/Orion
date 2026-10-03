@@ -8,6 +8,9 @@
 
 typedef struct OrionGPT2Tokenizer OrionGPT2Tokenizer;
 
+/// Load a Hugging Face byte-level BPE tokenizer.json, including special tokens.
+OrionGPT2Tokenizer* orion_bpe_tokenizer_load_json(const char* path);
+
 /// Load GPT-2 tokenizer from vocab + merges files.
 /// If paths are NULL, attempts to load from default HuggingFace cache.
 OrionGPT2Tokenizer* orion_gpt2_tokenizer_load(const char* vocab_path,

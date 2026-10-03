@@ -315,6 +315,21 @@ make clean      # Remove all build artifacts
 
 ## Weight Setup
 
+Qwen3.5-0.8B native text inference is available with `--model qwen35_0_8b`.
+It supports CPU inference and configurable ANE projection offload. Import the
+local checkpoint, then run:
+
+```bash
+python3 model/convert/hf_to_qwen35.py \
+  --source ~/.omlx/models/mlx-community/Qwen3.5-0.8B-4bit \
+  --output model/blobs/qwen35_0_8b
+./orion infer --model qwen35_0_8b --prompt "Hello!" --max_tokens 32 --ane-prefill
+```
+
+The importer requires `numpy` and `mlx`. The native CLI requires neither.
+The initial memory-mapped float32 export occupies about 2.8 GiB. See
+[Qwen3.5 setup, ANE split and validation](docs/qwen35.md) for the full instructions.
+
 ```bash
 # GPT-2 124M (inference)
 python model/convert/hf_to_blobs_gpt2.py    # → model/blobs/gpt2_124m/

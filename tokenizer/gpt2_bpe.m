@@ -62,6 +62,9 @@ struct OrionGPT2Tokenizer {
     unichar byte_to_unicode[256];
     uint8_t unicode_to_byte[512];
     void* bpe_cache;   // NSMutableDictionary<NSString*, NSString*>*
+    void* regex;
+    void* specials;
+    bool normalize_nfc;
 };
 
 // Accessors for type safety
@@ -276,7 +279,7 @@ OrionGPT2Tokenizer* orion_gpt2_tokenizer_load(const char* vocab_path,
     }
 
     if (!load_merges(tok, merges_path)) {
-        free(tok);
+        orion_gpt2_tokenizer_free(tok);
         return NULL;
     }
 
@@ -287,14 +290,91 @@ OrionGPT2Tokenizer* orion_gpt2_tokenizer_load(const char* vocab_path,
     return tok;
 }
 
+OrionGPT2Tokenizer* orion_bpe_tokenizer_load_json(const char* path) {
+    NSDictionary *root = [NSJSONSerialization JSONObjectWithData:
+        [NSData dataWithContentsOfFile:@(path)] ?: [NSData data] options:0 error:nil];
+    if (![root isKindOfClass:NSDictionary.class]) return NULL;
+    NSDictionary *model = root[@"model"];
+    if (![model isKindOfClass:NSDictionary.class] || ![model[@"vocab"] isKindOfClass:NSDictionary.class]) return NULL;
+    id normalizer = root[@"normalizer"];
+    if (normalizer && normalizer != NSNull.null &&
+        (![normalizer isKindOfClass:NSDictionary.class] || ![normalizer[@"type"] isEqual:@"NFC"])) return NULL;
+    NSArray *pre = root[@"pre_tokenizer"][@"pretokenizers"];
+    NSString *pattern = pre.count ? pre[0][@"pattern"][@"Regex"] : nil;
+    if (![model[@"type"] isEqual:@"BPE"] || ![pattern isKindOfClass:NSString.class]) return NULL;
+    NSError *error = nil;
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:&error];
+    if (!regex) { fprintf(stderr, "tokenizer: unsupported regex: %s\n", error.localizedDescription.UTF8String); return NULL; }
+    OrionGPT2Tokenizer *tok = calloc(1, sizeof(*tok));
+    build_byte_to_unicode(tok->byte_to_unicode);
+    build_unicode_to_byte(tok->byte_to_unicode, tok->unicode_to_byte);
+    NSMutableDictionary *enc = [model[@"vocab"] mutableCopy];
+    NSMutableDictionary *specials = [NSMutableDictionary dictionary];
+    for (NSDictionary *entry in root[@"added_tokens"]) {
+        if ([entry[@"normalized"] boolValue] || [entry[@"single_word"] boolValue] ||
+            [entry[@"lstrip"] boolValue] || [entry[@"rstrip"] boolValue]) {
+            free(tok); return NULL;
+        }
+        enc[entry[@"content"]] = entry[@"id"];
+        specials[entry[@"content"]] = entry[@"id"];
+    }
+    int size = 0;
+    for (NSNumber *v in enc.allValues) size = MAX(size, v.intValue + 1);
+    if (size <= 0 || size > 1000000) { free(tok); return NULL; }
+    NSMutableArray *dec = [NSMutableArray arrayWithCapacity:size];
+    for (int i = 0; i < size; i++) [dec addObject:@""];
+    for (NSString *key in enc) dec[[enc[key] unsignedIntegerValue]] = key;
+    NSMutableDictionary *ranks = [NSMutableDictionary dictionary];
+    for (id merge in model[@"merges"]) {
+        NSString *pair = [merge isKindOfClass:NSArray.class] ? [merge componentsJoinedByString:@" "] : merge;
+        ranks[pair] = @(tok->num_merges++);
+    }
+    tok->encoder = (void*)CFBridgingRetain(enc);
+    tok->decoder = (void*)CFBridgingRetain(dec);
+    tok->bpe_ranks = (void*)CFBridgingRetain(ranks);
+    tok->bpe_cache = (void*)CFBridgingRetain([NSMutableDictionary dictionary]);
+    tok->regex = (void*)CFBridgingRetain(regex);
+    tok->specials = (void*)CFBridgingRetain(specials);
+    tok->vocab_size = size;
+    tok->normalize_nfc = normalizer && normalizer != NSNull.null;
+    return tok;
+}
+
 int orion_gpt2_encode(OrionGPT2Tokenizer* tok, const char* text,
                       int* tokens, int max_tokens) {
     {
         NSString* nsText = [NSString stringWithUTF8String:text];
-        NSArray<NSString*>* pre_tokens = pre_tokenize(nsText);
+        NSMutableArray<NSString*>* pre_tokens = [NSMutableArray array];
+        if (!tok->regex) [pre_tokens addObjectsFromArray:pre_tokenize(nsText)];
+        else {
+            NSDictionary *specials = (__bridge NSDictionary*)tok->specials;
+            NSRegularExpression *regex = (__bridge NSRegularExpression*)tok->regex;
+            NSUInteger cursor = 0;
+            while (cursor < nsText.length) {
+                NSRange next = NSMakeRange(nsText.length, 0);
+                NSString *special = nil;
+                for (NSString *s in specials) {
+                    NSRange r = [nsText rangeOfString:s options:0 range:NSMakeRange(cursor, nsText.length-cursor)];
+                    if (r.location != NSNotFound && (r.location < next.location ||
+                        (r.location == next.location && r.length > next.length))) { next = r; special = s; }
+                }
+                NSString *plain = [nsText substringWithRange:NSMakeRange(cursor, next.location-cursor)];
+                if (tok->normalize_nfc) plain = plain.precomposedStringWithCanonicalMapping;
+                for (NSTextCheckingResult *match in [regex matchesInString:plain options:0 range:NSMakeRange(0, plain.length)])
+                    [pre_tokens addObject:[plain substringWithRange:match.range]];
+                if (special) [pre_tokens addObject:special];
+                cursor = next.location + next.length;
+            }
+        }
 
         int count = 0;
         for (NSString* chunk in pre_tokens) {
+            NSNumber *special = tok->specials ? ((__bridge NSDictionary*)tok->specials)[chunk] : nil;
+            if (special) {
+                if (count >= max_tokens) return -1;
+                tokens[count++] = special.intValue;
+                continue;
+            }
             const char* utf8 = chunk.UTF8String;
             int len = (int)strlen(utf8);
             NSString* encoded = bytes_to_unicode_str(utf8, len, tok->byte_to_unicode);
@@ -305,6 +385,7 @@ int orion_gpt2_encode(OrionGPT2Tokenizer* tok, const char* text,
             NSArray<NSString*>* bpe_tokens = [bpe_result componentsSeparatedByString:@" "];
             for (NSString* bt in bpe_tokens) {
                 NSNumber* id_num = TOK_ENCODER(tok)[bt];
+                if (tok->regex && (!id_num || count >= max_tokens)) return -1;
                 if (id_num && count < max_tokens) {
                     tokens[count++] = id_num.intValue;
                 }
@@ -349,5 +430,7 @@ void orion_gpt2_tokenizer_free(OrionGPT2Tokenizer* tok) {
     if (tok->decoder)   CFRelease(tok->decoder);
     if (tok->bpe_ranks) CFRelease(tok->bpe_ranks);
     if (tok->bpe_cache) CFRelease(tok->bpe_cache);
+    if (tok->regex) CFRelease(tok->regex);
+    if (tok->specials) CFRelease(tok->specials);
     free(tok);
 }

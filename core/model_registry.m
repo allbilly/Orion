@@ -35,6 +35,13 @@ static const OrionModelSpec kModels[] = {
         .n_buckets = 0,
         .default_weights_dir = "model/blobs/stories110m",
     },
+    {
+        .name = "qwen35_0_8b",
+        .config = {.n_layer=24, .n_head=8, .d_model=1024, .head_dim=256,
+                   .hidden_dim=3584, .vocab=248320, .max_seq=32768},
+        .buckets = NULL, .n_buckets = 0,
+        .default_weights_dir = "model/blobs/qwen35_0_8b",
+    },
 };
 
 static const int kModelCount = sizeof(kModels) / sizeof(kModels[0]);

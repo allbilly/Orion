@@ -24,6 +24,7 @@ static void print_infer_help(void) {
         "Usage: orion infer [options]\n"
         "\n"
         "Options:\n"
+        "  --model NAME           gpt2_124m (default) or qwen35_0_8b\n"
         "  --prompt TEXT          Input prompt (required)\n"
         "  --max_tokens N         Maximum tokens to generate (default: 128)\n"
         "  --temperature FLOAT    Sampling temperature (0=greedy, default: 0.0)\n"
@@ -46,6 +47,15 @@ static double time_ms(void) {
 }
 
 int orion_cmd_infer(int argc, const char* argv[]) {
+    extern int orion_cmd_infer_qwen35(int argc, const char* argv[]);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--model") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "--model requires a value\n"); return 1; }
+            if (strcmp(argv[i+1], "qwen35_0_8b") == 0) return orion_cmd_infer_qwen35(argc, argv);
+            if (strcmp(argv[i+1], "gpt2_124m") != 0) { fprintf(stderr, "Unsupported inference model: %s\n", argv[i+1]); return 1; }
+            i++;
+        }
+    }
     // Parse arguments
     const char* prompt = NULL;
     int max_tokens = 128;
